@@ -2132,6 +2132,13 @@ export default function App() {
   useEffect(() => { if (loaded) saveKey("hs:transactions", transactions, shared); }, [transactions, loaded, shared]);
   useEffect(() => { if (loaded) saveKey("hs:budgets", budgets, shared); }, [budgets, loaded, shared]);
   useEffect(() => { if (loaded) saveKey("hs:loans", loans, shared); }, [loans, loaded, shared]);
+  // هر حساب بانکی/کارت در «حساب‌ها و کارت‌ها» یک حساب هم‌نام در درخت «حساب‌ها ← بانک‌ها» دارد (برای اتصال به موجودی واقعی)
+  useEffect(() => {
+    if (!loaded) return;
+    const missing = accounts.filter((a) => (a.type === "bank" || a.type === "card") && a.name && !categories.some((c) => c.kind === "bank" && faKey(c.name) === faKey(a.name)));
+    if (missing.length) setCategories((p) => [...p, ...missing.map((a) => ({ id: uid(), name: a.name, kind: "bank", autoFromAccount: a.id }))]);
+  }, [loaded, accounts, categories]);
+
   useEffect(() => { if (loaded) saveKey("hs:checks", checks, shared); }, [checks, loaded, shared]);
   useEffect(() => { if (loaded) saveKey("hs:bills", bills, shared); }, [bills, loaded, shared]);
   useEffect(() => { if (loaded) saveKey("hs:assets", assets, shared); }, [assets, loaded, shared]);
@@ -2494,7 +2501,7 @@ export default function App() {
     persons, setPersons, debts, setDebts, currencies, setCurrencies, goals, setGoals,
     fiscalPeriods, setFiscalPeriods, openWithPrefill,
     notes, setNotes, reminders, setReminders, rates, fetchRates,
-    addTransaction, updateTransaction, rebuildData, clearAllData,
+    addTransaction, updateTransaction, deleteTransaction, setTransactions, rebuildData, clearAllData,
     cloud, updateInfo, updateMsg, checkUpdateNow,
   };
 
@@ -3028,8 +3035,9 @@ function TransactionsView({ transactions, catById, accById, checks = [], filter,
                         <span style={{ width: 38, height: 38, borderRadius: 10, background: color + "22", color, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon size={18} /></span>
                         <div>
                           <div style={{ fontWeight: 700, fontSize: 14 }}>{tx.type === "transfer" ? `انتقال به ${toAcc?.name || "—"}` : (cat?.name || "بدون دسته")}</div>
-                          <div style={{ fontSize: 12, color: t.sub, marginTop: 3 }}>{tx.type === "expense" ? "از حساب" : tx.type === "income" ? "به حساب" : "از حساب"}: {acc?.name || "—"}</div>
+                          <div style={{ fontSize: 12, color: t.sub, marginTop: 3 }}>{tx.type === "expense" ? "از حساب" : tx.type === "income" ? "به حساب" : "از حساب"}: {acc?.name || catById(tx.fromCategoryId)?.name || "—"}</div>
                           {tx.note && <div style={{ fontSize: 12, color: t.sub, marginTop: 2 }}>{tx.note}</div>}
+                          {tx.loanId && <span style={{ display: "inline-block", marginTop: 4, marginLeft: 6, fontSize: 10.5, fontWeight: 700, color: "#8a5a00", background: "rgba(245,158,11,.16)", borderRadius: 10, padding: "1px 8px" }}>{tx.loanRole === "receipt" ? "دریافت وام" : "قسط وام"}</span>}
                           {tx.side && <span style={{ display: "inline-block", marginTop: 4, fontSize: 10.5, fontWeight: 700, color: BRAND.violet, background: "rgba(88,39,119,.10)", borderRadius: 10, padding: "1px 8px" }}>{tx.side === "debtor" ? "بدهکار" : "بستانکار"}</span>}
                           {(tx.tags || []).length > 0 && (
                             <div style={{ display: "flex", gap: 5, marginTop: 5, flexWrap: "wrap" }}>
@@ -4246,113 +4254,88 @@ function ChecksManager({ checks, setChecks }) {
 /* ---------------------------------------------------------
    Loans Manager
 --------------------------------------------------------- */
-function LoansManager({ loans, setLoans, categories = [] }) {
+/* وام‌ها به حساب بانکی وصل‌اند: دریافت وام = افزایش موجودی، هر قسط = کاهش موجودی (به‌صورت تراکنش‌های واقعی با برچسب «وام») */
+const LOAN_CAT_RECEIPT = "cat-loan-receipt", LOAN_CAT_INSTALL = "cat-loan-installment";
+const loanReceiptTx = (l, id, createdAt) => ({ id: id || uid(), type: "income", amount: l.principal, categoryId: LOAN_CAT_RECEIPT, accountId: l.accountId, date: l.startDate, time: "08:00", note: `دریافت وام «${l.title}»`, tags: ["وام"], loanId: l.id, loanRole: "receipt", createdAt: createdAt || new Date().toISOString() });
+const loanInstallmentTx = (l, seq) => ({ id: uid(), type: "expense", amount: l.monthlyPayment, categoryId: LOAN_CAT_INSTALL, accountId: l.accountId, date: todayISO(), time: new Date().toTimeString().slice(0, 5), note: `قسط ${seq} از ${l.installments} وام «${l.title}»`, tags: ["وام", "قسط"], loanId: l.id, loanRole: "installment", loanSeq: seq, createdAt: new Date().toISOString() });
+function LoansManager({ loans, setLoans, accounts = [], categories = [], addCategory, setTransactions }) {
   const st = useStyles();
-  const t = useT();
-  const [form, setForm] = useState({ title: "", principal: "", installments: "", monthlyPayment: "", startDate: todayISO(), spent: false, accountId: "" });
+  const emptyForm = () => ({ title: "", principal: "", installments: "", monthlyPayment: "", startDate: todayISO(), spent: false, accountId: "" });
+  const [form, setForm] = useState(emptyForm());
   const [editingId, setEditingId] = useState(null);
-  const [editForm, setEditForm] = useState(null);
-  const [accountOpen, setAccountOpen] = useState(false);
-  const [editAccountOpen, setEditAccountOpen] = useState(false);
-
-  // «از حساب» در وام از همان درخت «حساب‌ها» می‌آید، اما بانک‌ها و حساب‌های
-  // دوطرفه (بدهکار + بستانکار) اجازه انتخاب دارند. سایر حساب‌ها
-  // برای شفافیت نمایش داده می‌شوند ولی غیرفعال هستند.
-  const eligibleAccounts = categories.filter((c) => c.kind === "bank" || c.twoWay === true);
-  const allAccounts = [...categories].sort((a, b) => accountPath(categories, a).join(" / ").localeCompare(accountPath(categories, b).join(" / "), "fa"));
-  const accountName = (id) => {
-    const c = categories.find((x) => x.id === id);
-    return c ? accountPath(categories, c).join(" / ") : "انتخاب نشده";
+  const ensureLoanCats = () => {
+    if (!categories.some((c) => c.id === LOAN_CAT_RECEIPT)) addCategory?.({ id: LOAN_CAT_RECEIPT, name: "دریافت وام", kind: "liability" });
+    if (!categories.some((c) => c.id === LOAN_CAT_INSTALL)) addCategory?.({ id: LOAN_CAT_INSTALL, name: "قسط وام", kind: "liability" });
   };
-  const isEligibleAccount = (id) => eligibleAccounts.some((a) => a.id === id);
-
-  function resetForm() {
-    setForm({ title: "", principal: "", installments: "", monthlyPayment: "", startDate: todayISO(), spent: false, accountId: "" });
+  const accName = (id) => accounts.find((a) => a.id === id)?.name || "";
+  function submit() {
+    if (!form.title || !form.principal || !form.installments || !form.monthlyPayment) return;
+    const base = { title: form.title.trim(), principal: Number(form.principal), installments: Number(form.installments), monthlyPayment: Number(form.monthlyPayment), startDate: form.startDate, spent: !!form.spent, accountId: form.accountId || "" };
+    ensureLoanCats();
+    if (editingId) {
+      const old = loans.find((x) => x.id === editingId); if (!old) return;
+      const next = { ...old, ...base, paidCount: Math.min(old.paidCount || 0, base.installments) };
+      setLoans((p) => p.map((x) => x.id === old.id ? next : x));
+      setTransactions?.((prev) => {
+        const oldReceipt = prev.find((t) => t.loanId === old.id && t.loanRole === "receipt");
+        let list = prev.filter((t) => !(t.loanId === old.id && t.loanRole === "receipt") && !(t.loanId === old.id && t.loanRole === "installment" && t.loanSeq > next.paidCount));
+        list = list.map((t) => t.loanId === old.id && t.loanRole === "installment" ? { ...t, ...(next.accountId ? { accountId: next.accountId } : {}), note: `قسط ${t.loanSeq} از ${next.installments} وام «${next.title}»` } : t);
+        if (!next.spent && next.accountId) list = [loanReceiptTx(next, oldReceipt?.id, oldReceipt?.createdAt), ...list];   // وام قدیمی/خرج‌شده موجودی را زیاد نمی‌کند
+        return list;
+      });
+      setEditingId(null);
+    } else {
+      const loan = { id: uid(), ...base, paidCount: 0 };
+      setLoans((p) => [...p, loan]);
+      if (!loan.spent && loan.accountId) setTransactions?.((prev) => [loanReceiptTx(loan), ...prev]);
+    }
+    setForm(emptyForm());
   }
-
-  function add() {
-    const installments = Number(form.installments || 0);
-    if (!form.title.trim() || !Number(form.principal) || !installments || !Number(form.monthlyPayment) || !form.accountId) return;
-    if (!isEligibleAccount(form.accountId)) { alert("«از حساب» باید از بین حساب‌های بانکی یا حساب‌های دوطرفه انتخاب شود."); return; }
-    setLoans((p) => [...p, {
-      id: uid(), title: form.title.trim(), principal: Number(form.principal), installments,
-      monthlyPayment: Number(form.monthlyPayment), startDate: form.startDate, paidCount: 0,
-      spent: !!form.spent, accountId: form.accountId,
-    }]);
-    resetForm();
-  }
-
-  function openEdit(l) {
+  function startEdit(l) {
+    setForm({ title: l.title, principal: String(l.principal), installments: String(l.installments), monthlyPayment: String(l.monthlyPayment), startDate: l.startDate, spent: !!l.spent, accountId: l.accountId || "" });
     setEditingId(l.id);
-    setEditForm({ title: l.title || "", principal: String(l.principal || ""), installments: String(l.installments || ""), monthlyPayment: String(l.monthlyPayment || ""), startDate: l.startDate || todayISO(), spent: !!l.spent, accountId: l.accountId || "" });
+    setTimeout(() => { try { document.getElementById("loan-form")?.scrollIntoView({ behavior: "smooth", block: "start" }); } catch {} }, 60);
   }
-
-  function saveEdit(l) {
-    if (!editForm) return;
-    const installments = Number(editForm.installments || 0);
-    const principal = Number(editForm.principal || 0);
-    const monthlyPayment = Number(editForm.monthlyPayment || 0);
-    if (!editForm.title.trim() || !principal || !installments || !monthlyPayment || !editForm.accountId) return;
-    if (installments < Number(l.paidCount || 0)) { alert(`تعداد اقساط نمی‌تواند کمتر از اقساط پرداخت‌شده (${toFaInt(l.paidCount || 0)}) باشد.`); return; }
-    if (!isEligibleAccount(editForm.accountId)) { alert("«از حساب» باید از بین حساب‌های بانکی یا حساب‌های دوطرفه انتخاب شود."); return; }
-    setLoans((p) => p.map((x) => x.id === l.id ? {
-      ...x, title: editForm.title.trim(), principal, installments, monthlyPayment,
-      startDate: editForm.startDate, spent: !!editForm.spent, accountId: editForm.accountId,
-    } : x));
-    setEditingId(null); setEditForm(null);
+  function removeLoan(l) {
+    if (!window.confirm(`وام «${l.title}» با تراکنش‌های دریافت و اقساط مرتبطش حذف شود؟`)) return;
+    setLoans((p) => p.filter((x) => x.id !== l.id));
+    setTransactions?.((prev) => prev.filter((t) => t.loanId !== l.id));
+    if (editingId === l.id) { setEditingId(null); setForm(emptyForm()); }
   }
-
-  function undoLastPayment(l) {
-    if (!Number(l.paidCount)) return;
-    if (!window.confirm("آخرین پرداخت قسط اصلاح شود و یک قسط از تعداد پرداخت‌شده کم شود؟")) return;
-    setLoans((p) => p.map((x) => x.id === l.id ? { ...x, paidCount: Math.max(0, Number(x.paidCount || 0) - 1) } : x));
+  function payInstallment(l) {
+    if (l.paidCount >= l.installments) return;
+    const seq = l.paidCount + 1;
+    ensureLoanCats();
+    setLoans((p) => p.map((x) => x.id === l.id ? { ...x, paidCount: seq } : x));
+    if (l.accountId) setTransactions?.((prev) => [loanInstallmentTx(l, seq), ...prev]);
   }
-
-  const renderAccountPicker = (value, onChange, open, setOpen) => (
-    open && toBody(<div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 760, display: "flex", alignItems: "flex-end", justifyContent: "center", maxWidth: 480, margin: "0 auto", fontFamily: FONT, direction: "rtl" }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ background: t.bg || t.card, width: "100%", maxHeight: "76vh", overflowY: "auto", borderRadius: "18px 18px 0 0", padding: "16px 14px calc(18px + env(safe-area-inset-bottom, 0px))" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <button type="button" onClick={() => setOpen(false)} style={{ border: 0, background: "transparent", color: t.sub, padding: 5 }}><X size={21} /></button>
-          <div style={{ fontWeight: 800, fontSize: 15 }}>از حساب</div><span style={{ width: 31 }} />
-        </div>
-        <div style={{ fontSize: 11.5, color: t.sub, lineHeight: 1.8, marginBottom: 8 }}>
-          همه حساب‌ها نمایش داده می‌شوند؛ حساب‌های «بانک» و حساب‌های دارای تیک «دو طرفه» قابل انتخاب هستند.
-        </div>
-        {!allAccounts.length && <EmptyRow text="حسابی تعریف نشده" />}
-        {allAccounts.map((a) => {
-          const canPick = a.kind === "bank" || a.twoWay === true;
-          const on = a.id === value;
-          return <button key={a.id} type="button" disabled={!canPick} onClick={() => { onChange(a.id); setOpen(false); }} style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "12px 6px", border: 0, borderBottom: `1px solid ${t.border}`, background: "transparent", cursor: canPick ? "pointer" : "not-allowed", fontFamily: "inherit", color: canPick ? t.text : t.sub, textAlign: "right", opacity: canPick ? 1 : .55 }}>
-            <span style={{ width: 20, height: 20, borderRadius: "50%", border: `2px solid ${on ? BRAND.header : t.sub}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{on && <span style={{ width: 10, height: 10, borderRadius: "50%", background: BRAND.header }} />}</span>
-            <span style={{ flex: 1, fontSize: 13.5, fontWeight: on ? 800 : 600 }}>{accountPath(categories, a).join(" / ")}</span>
-            <span style={{ fontSize: 10.5, color: canPick ? BRAND.darkgreen : t.sub, fontWeight: 700 }}>{canPick ? "قابل انتخاب" : "غیرفعال"}</span>
-          </button>;
-        })}
-      </div>
-    </div>)
-  );
-
-  const accountField = (value, setOpen) => <button type="button" onClick={() => setOpen(true)} style={{ width: "100%", minHeight: 46, marginBottom: 8, padding: "9px 12px", borderRadius: 10, border: `1.5px solid ${t.inputBorder}`, background: t.input, color: value ? t.text : t.sub, display: "flex", alignItems: "center", justifyContent: "space-between", fontFamily: "inherit", cursor: "pointer", textAlign: "right" }}>
-    <span style={{ fontSize: 13.5, fontWeight: value ? 700 : 500 }}>{value ? accountName(value) : "انتخاب از حساب"}</span><ChevronLeft size={17} style={{ transform: "rotate(90deg)", flexShrink: 0 }} />
-  </button>;
-
+  function undoLast(l) {
+    if (!l.paidCount) return;
+    if (!window.confirm(`قسط شماره ${l.paidCount} برگردانده شود؟${l.accountId ? " مبلغ آن به حساب بانکی برمی‌گردد." : ""}`)) return;
+    setLoans((p) => p.map((x) => x.id === l.id ? { ...x, paidCount: x.paidCount - 1 } : x));
+    setTransactions?.((prev) => prev.filter((t) => !(t.loanId === l.id && t.loanRole === "installment" && t.loanSeq === l.paidCount)));
+  }
   return (
     <div>
-      <div style={{ ...st.card, padding: 14, marginBottom: 16 }}>
-        <div style={{ fontWeight: 700, marginBottom: 10, fontSize: 14 }}>ثبت وام جدید</div>
+      <div id="loan-form" style={{ ...st.card, padding: 14, marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, marginBottom: 10, fontSize: 14 }}>{editingId ? "ویرایش وام" : "ثبت وام جدید"}</div>
         <input placeholder="عنوان وام (مثلا وام خودرو)" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} style={st.input} />
-        {accountField(form.accountId, setAccountOpen)}
         <AmountInput placeholder="مبلغ اصل وام" value={form.principal} onChange={(v) => setForm({ ...form, principal: v })} style={st.input} />
         <KeypadInput kind="digits" placeholder="تعداد اقساط" value={form.installments} onChange={(e) => setForm({ ...form, installments: e.target.value.replace(/[^0-9]/g, "") })} style={st.input} inputMode="numeric" />
         <AmountInput placeholder="مبلغ هر قسط" value={form.monthlyPayment} onChange={(v) => setForm({ ...form, monthlyPayment: v })} style={st.input} />
-        <label style={st.label}>تاریخ شروع</label>
+        <label style={st.label}>تاریخ شروع (تاریخ دریافت وام)</label>
         <JalaliDateInput value={form.startDate} onChange={(v) => setForm({ ...form, startDate: v })} style={st.input} />
+        <label style={st.label}>حساب بانکی</label>
+        <SourceAccountField accounts={accounts} categories={categories} accountId={form.accountId} fromCategoryId="" allowTwoWay={false} title="انتخاب حساب بانکی" onChange={(v) => setForm({ ...form, accountId: v.accountId })} st={st} />
+        <div style={{ fontSize: 11.5, color: "#8a8194", lineHeight: 1.9, margin: "-2px 0 8px" }}>دریافت وام به موجودی این حساب اضافه و هر قسط از آن کم می‌شود. اگر انتخاب نکنی، تراکنشی در حساب بانکی ثبت نمی‌شود.</div>
         <label style={{ display: "flex", alignItems: "flex-start", gap: 10, margin: "4px 0 14px", fontSize: 13, fontWeight: 700, lineHeight: 1.9, cursor: "pointer" }}>
           <input type="checkbox" checked={!!form.spent} onChange={(e) => setForm({ ...form, spent: e.target.checked })} style={{ width: 20, height: 20, marginTop: 4, flexShrink: 0 }} />
-          <span>مبلغ این وام قبلاً دریافت و خرج شده است (وام قدیمی)<br /><span style={{ fontWeight: 500, fontSize: 11.5, color: "#8a8194" }}>در ترازنامه و مانده‌ی دارایی خالص حساب نمی‌شود تا ناترازی ایجاد نکند؛ اقساط و یادآوری‌ها مثل قبل کار می‌کنند.</span></span>
+          <span>مبلغ این وام قبلاً دریافت و خرج شده است (وام قدیمی)<br /><span style={{ fontWeight: 500, fontSize: 11.5, color: "#8a8194" }}>موجودی بانک را افزایش نمی‌دهد و در ترازنامه ناترازی ایجاد نمی‌کند؛ اقساط بعدی همچنان از حساب کم می‌شود.</span></span>
         </label>
-        <button onClick={add} disabled={!eligibleAccounts.length} style={{ ...st.primaryBtn, opacity: eligibleAccounts.length ? 1 : .5 }}>ثبت وام</button>
-        {!eligibleAccounts.length && <div style={{ color: BRAND.crimson, fontSize: 11.5, marginTop: 8, lineHeight: 1.8 }}>برای ثبت وام ابتدا در «حساب‌ها» یک حساب از نوع «بانک» بسازید و گزینه «دو طرفه (هم بدهکار هم بستانکار)» را فعال کنید.</div>}
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={submit} style={st.primaryBtn}>{editingId ? "ذخیره تغییرات" : "ثبت وام"}</button>
+          {editingId && <button onClick={() => { setEditingId(null); setForm(emptyForm()); }} style={{ ...st.primaryBtn, background: "#e9e5ef", color: "#3E1461", width: "auto", padding: "0 18px" }}>انصراف</button>}
+        </div>
       </div>
       <div style={{ ...st.card, padding: "4px 12px" }}>
         {loans.length === 0 && <EmptyRow text="وامی ثبت نشده" />}
@@ -4361,40 +4344,26 @@ function LoansManager({ loans, setLoans, categories = [] }) {
           const nextDue = addMonths(l.startDate, l.paidCount);
           return (
             <div key={l.id} style={{ padding: "12px 4px", borderBottom: "1px solid #f0eef3" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
                 <span style={{ fontWeight: 700, fontSize: 14 }}>{l.title}{l.spent && <span style={{ marginRight: 8, fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 10, background: "#f1eef4", color: "#6b6377" }}>خرج‌شده</span>}</span>
-                <div style={{ display: "flex", gap: 2 }}>
-                  <button onClick={() => openEdit(l)} title="ویرایش وام و اقساط" style={{ background: "none", border: "none", color: BRAND.violet, cursor: "pointer" }}><Pencil size={15} /></button>
-                  <button onClick={() => { if (window.confirm("این وام حذف شود؟")) setLoans((p) => p.filter((x) => x.id !== l.id)); }} title="حذف وام" style={{ background: "none", border: "none", color: BRAND.crimson, cursor: "pointer" }}><Trash2 size={15} /></button>
-                </div>
+                <span style={{ display: "flex", gap: 4 }}>
+                  <button onClick={() => startEdit(l)} aria-label="ویرایش" style={{ background: "none", border: "none", color: BRAND.violet, cursor: "pointer" }}><Pencil size={15} /></button>
+                  <button onClick={() => removeLoan(l)} aria-label="حذف" style={{ background: "none", border: "none", color: BRAND.crimson, cursor: "pointer" }}><Trash2 size={15} /></button>
+                </span>
               </div>
-              <div style={{ fontSize: 11.5, color: t.sub, marginBottom: 4 }}>از حساب: {accountName(l.accountId)}</div>
               <div style={{ fontSize: 12.5, color: "#8a8194", marginBottom: 4 }}>قسط {toFaInt(l.paidCount)} از {toFaInt(l.installments)} پرداخت شده — سررسید بعدی: {l.paidCount < l.installments ? faLongDate(new Date(nextDue)) : "تسویه شده"}</div>
+              <div style={{ fontSize: 12, color: "#8a8194", marginBottom: 6 }}>{l.accountId && accName(l.accountId) ? `حساب بانکی: ${accName(l.accountId)}` : "بدون اتصال به حساب بانکی"}</div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <span style={{ fontWeight: 700, color: remaining > 0 ? BRAND.crimson : BRAND.darkgreen }}>باقی‌مانده: {toFaInt(Math.max(remaining, 0))} ریال</span>
-                <div style={{ display: "flex", gap: 6 }}>
-                  {l.paidCount > 0 && <button onClick={() => undoLastPayment(l)} style={{ background: "#f1eef4", color: "#5f566b", border: "none", borderRadius: 8, padding: "6px 10px", fontSize: 11.5, fontWeight: 700, cursor: "pointer" }}>اصلاح آخرین قسط</button>}
-                  {l.paidCount < l.installments && <button onClick={() => setLoans((p) => p.map((x) => x.id === l.id ? { ...x, paidCount: x.paidCount + 1 } : x))} style={{ background: BRAND.green, color: "#fff", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>ثبت پرداخت قسط</button>}
-                </div>
+                <span style={{ display: "flex", gap: 6 }}>
+                  {l.paidCount > 0 && <button onClick={() => undoLast(l)} style={{ background: "#f1eef4", color: BRAND.header, border: "none", borderRadius: 8, padding: "6px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>اصلاح آخرین قسط</button>}
+                  {l.paidCount < l.installments && <button onClick={() => payInstallment(l)} style={{ background: BRAND.green, color: "#fff", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>ثبت پرداخت قسط</button>}
+                </span>
               </div>
-              {editingId === l.id && editForm && <div style={{ background: "#f7f4fa", borderRadius: 12, padding: 10, marginTop: 10 }}>
-                <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 8 }}>ویرایش وام / اقساط</div>
-                <input value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} placeholder="عنوان وام" style={{ ...st.input, marginBottom: 7 }} />
-                {accountField(editForm.accountId, setEditAccountOpen)}
-                <AmountInput value={editForm.principal} onChange={(v) => setEditForm({ ...editForm, principal: v })} placeholder="مبلغ اصل وام" style={{ ...st.input, marginBottom: 7 }} />
-                <KeypadInput kind="digits" value={editForm.installments} onChange={(e) => setEditForm({ ...editForm, installments: e.target.value.replace(/[^0-9]/g, "") })} placeholder="تعداد اقساط" style={{ ...st.input, marginBottom: 7 }} inputMode="numeric" />
-                <AmountInput value={editForm.monthlyPayment} onChange={(v) => setEditForm({ ...editForm, monthlyPayment: v })} placeholder="مبلغ هر قسط" style={{ ...st.input, marginBottom: 7 }} />
-                <label style={st.label}>تاریخ شروع</label>
-                <JalaliDateInput value={editForm.startDate} onChange={(v) => setEditForm({ ...editForm, startDate: v })} style={{ ...st.input, marginBottom: 7 }} />
-                <label style={{ display: "flex", alignItems: "center", gap: 8, margin: "4px 0 10px", fontSize: 12.5, fontWeight: 700 }}><input type="checkbox" checked={!!editForm.spent} onChange={(e) => setEditForm({ ...editForm, spent: e.target.checked })} style={{ width: 18, height: 18 }} /> وام قدیمی/خرج‌شده</label>
-                <div style={{ display: "flex", gap: 8 }}><button onClick={() => saveEdit(l)} style={{ ...st.primaryBtn, flex: 1, marginTop: 0 }}>ذخیره اصلاحات</button><button onClick={() => { setEditingId(null); setEditForm(null); }} style={{ ...st.primaryBtn, flex: 1, marginTop: 0, background: "#eee", color: "#333" }}>انصراف</button></div>
-              </div>}
             </div>
           );
         })}
       </div>
-      {renderAccountPicker(form.accountId, (id) => setForm((f) => ({ ...f, accountId: id })), accountOpen, setAccountOpen)}
-      {editForm && renderAccountPicker(editForm.accountId, (id) => setEditForm((f) => ({ ...f, accountId: id })), editAccountOpen, setEditAccountOpen)}
     </div>
   );
 }
@@ -5160,12 +5129,12 @@ function accountPath(categories, c) {
   while (p?.parentId && guard++ < 8) { p = categories.find((x) => x.id === p.parentId); if (p) names.unshift(p.name); }
   return [ACCOUNT_GROUPS.find((g) => g.kind === c.kind)?.label || "سایر", ...names];
 }
-function AccountsTree({ categories = [], transactions = [], addCategory, deleteCategory, updateCategory, favorites, toggleFavorite, mode = "manage", value, onPick }) {
+function AccountsTree({ categories = [], transactions = [], addCategory, deleteCategory, updateCategory, favorites, toggleFavorite, mode = "manage", value, onPick, selectable, onBlocked, defaultExpanded }) {
   const st = useStyles();
   const t = useT();
   const picking = mode === "pick";
   const [query, setQuery] = useState("");
-  const [expanded, setExpanded] = useState({});
+  const [expanded, setExpanded] = useState(defaultExpanded || {});
   const [addFor, setAddFor] = useState(null);
   const [addName, setAddName] = useState("");
   const [editId, setEditId] = useState(null);
@@ -5216,16 +5185,17 @@ function AccountsTree({ categories = [], transactions = [], addCategory, deleteC
     const kids = flat ? [] : childrenOf(c.id);
     const isOpen = !!expanded[c.id];
     const selected = picking && c.id === value;
+    const locked = !!(picking && selectable && !selectable(c));   // نمایش داده می‌شود ولی قابل انتخاب نیست
     const path = flat ? accountPath(categories, c).slice(0, -1).join(" / ") : "";
     return (
       <div key={c.id}>
-        <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "9px 4px", paddingRight: 4 + depth * 18, borderBottom: `1px solid ${t.border}`, background: selected ? "rgba(88,39,119,.08)" : "transparent" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "9px 4px", paddingRight: 4 + depth * 18, borderBottom: `1px solid ${t.border}`, background: selected ? "rgba(88,39,119,.08)" : "transparent", opacity: locked ? 0.42 : 1 }}>
           {editId === c.id ? (<>
             <input autoFocus value={editVal} onChange={(e) => setEditVal(e.target.value)} style={{ flex: 1, padding: "6px 10px", borderRadius: 7, border: `1.5px solid ${t.inputBorder}`, background: t.input, color: t.text, fontSize: 13 }} />
             <button onClick={() => { if (editVal.trim()) updateCategory?.(c.id, { name: editVal.trim(), ...(depth === 0 ? { twoWay: editTwoWay } : {}) }); setEditId(null); }} style={{ background: BRAND.green, border: "none", borderRadius: 7, color: "#fff", padding: "6px 10px", cursor: "pointer" }}><Check size={14} /></button>
             <button onClick={() => setEditId(null)} style={smallBtn(t.sub)}><X size={14} /></button>
           </>) : (<>
-            <div onClick={picking ? () => onPick?.(c.id) : kids.length ? () => toggle(c.id) : undefined} style={{ flex: 1, minWidth: 0, cursor: picking || kids.length ? "pointer" : "default" }}>
+            <div onClick={picking ? (locked ? () => { if (kids.length) toggle(c.id); else onBlocked?.(c); } : () => onPick?.(c.id)) : kids.length ? () => toggle(c.id) : undefined} style={{ flex: 1, minWidth: 0, cursor: picking || kids.length ? "pointer" : "default" }}>
               <div style={{ fontSize: depth ? 13 : 14, fontWeight: selected ? 800 : depth ? 500 : 600, color: t.text }}>{depth > 0 && "↳ "}{c.name}{c.twoWay && <span style={{ marginRight: 6, fontSize: 10.5, fontWeight: 700, color: BRAND.violet, background: "rgba(88,39,119,.10)", borderRadius: 10, padding: "1px 7px" }}>↔ دو طرفه</span>}</div>
               {c.twoWay && !picking && !flat && (() => { const tt = twoWayTotals(c); return (tt.debit || tt.credit) ? <div style={{ fontSize: 11, color: t.sub, marginTop: 2 }}>بدهکار: {toFaInt(tt.debit)} · بستانکار: {toFaInt(tt.credit)} · مانده: {toFaInt(Math.abs(tt.debit - tt.credit))} {tt.debit >= tt.credit ? "بدهکار" : "بستانکار"}</div> : null; })()}
               {flat && path && <div style={{ fontSize: 11, color: t.sub, marginTop: 2 }}>{path}</div>}
@@ -5233,7 +5203,7 @@ function AccountsTree({ categories = [], transactions = [], addCategory, deleteC
             {selected && <Check size={16} color={BRAND.darkgreen} />}
             {!picking && toggleFavorite && <button onClick={() => toggleFavorite("categories", c.id)} style={smallBtn("#f5b301")}><Star size={15} fill={favIds.includes(c.id) ? "#f5b301" : "none"} color="#f5b301" /></button>}
             {!picking && <button onClick={() => { setEditId(c.id); setEditVal(c.name); setEditTwoWay(!!c.twoWay); }} style={smallBtn(BRAND.violet)}><Pencil size={15} /></button>}
-            <button onClick={() => { setAddFor(addFor?.parentId === c.id ? null : { kind: c.kind, parentId: c.id }); setAddName(""); setExpanded((e) => ({ ...e, [c.id]: true })); }} style={smallBtn(BRAND.green)}><Plus size={15} /></button>
+            {!selectable && <button onClick={() => { setAddFor(addFor?.parentId === c.id ? null : { kind: c.kind, parentId: c.id }); setAddName(""); setExpanded((e) => ({ ...e, [c.id]: true })); }} style={smallBtn(BRAND.green)}><Plus size={15} /></button>}
             {!picking && <button onClick={() => { if (window.confirm(`«${c.name}»${childrenOf(c.id).length ? " و زیرمجموعه‌هایش" : ""} حذف شود؟`)) deleteCategory?.(c.id); }} style={smallBtn(BRAND.crimson)}><Trash2 size={15} /></button>}
             {kids.length > 0 ? <button onClick={() => toggle(c.id)} style={smallBtn(t.sub)}>{arrowIcon(isOpen)}</button> : <span style={{ width: 25, flexShrink: 0 }} />}
           </>)}
@@ -5266,10 +5236,10 @@ function AccountsTree({ categories = [], transactions = [], addCategory, deleteC
             {roots.length === 0 && <EmptyRow text={`هنوز موردی در «${g.label}» ثبت نشده`} />}
             {roots.map((c) => renderNode(c, 0))}
             {addingHere && renderAddForm(g.kind, null, 0)}
-            <div onClick={() => { setAddFor(addingHere ? null : { kind: g.kind, parentId: null }); setAddName(""); }} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 4px", cursor: "pointer", color: BRAND.header, fontWeight: 700, fontSize: 13 }}>
+            {!selectable && (<div onClick={() => { setAddFor(addingHere ? null : { kind: g.kind, parentId: null }); setAddName(""); }} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 4px", cursor: "pointer", color: BRAND.header, fontWeight: 700, fontSize: 13 }}>
               <span style={{ width: 24, height: 24, borderRadius: "50%", background: BRAND.header, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" }}><Plus size={14} /></span>
               مورد جدید در «{g.label}»
-            </div>
+            </div>)}
           </div>
         )}
       </div>
@@ -5288,7 +5258,7 @@ function AccountsTree({ categories = [], transactions = [], addCategory, deleteC
           {results.length === 0 ? <EmptyRow text="موردی پیدا نشد" /> : results.map((c) => renderNode(c, 0, true))}
         </div>
       ) : ACCOUNT_GROUPS.map(renderGroup)}
-      <div style={{ ...st.card, padding: 12, marginTop: 4, border: `1.5px dashed ${t.inputBorder}`, boxShadow: "none" }}>
+      {!selectable && (<div style={{ ...st.card, padding: 12, marginTop: 4, border: `1.5px dashed ${t.inputBorder}`, boxShadow: "none" }}>
         <div onClick={() => setShowNew((v) => !v)} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", color: BRAND.header, fontWeight: 800, fontSize: 13.5 }}>
           <span style={{ width: 26, height: 26, borderRadius: "50%", background: BRAND.header, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" }}><Plus size={15} /></span>
           ایجاد حساب جدید
@@ -5306,7 +5276,7 @@ function AccountsTree({ categories = [], transactions = [], addCategory, deleteC
             <button onClick={() => { const nm = newName, tw = newTwoWay; setNewName(""); setNewTwoWay(false); setShowNew(false); create(newKind, null, nm, tw); }} style={st.primaryBtn}>افزودن</button>
           </div>
         )}
-      </div>
+      </div>)}
     </div>
   );
 }
@@ -5360,6 +5330,53 @@ function AccountPickerField({ categories, value, onChange, addCategory, st }) {
   </>;
 }
 
+// «از حساب / به حساب»: همان درخت حساب‌ها؛ همه نمایش داده می‌شوند ولی فقط «بانک‌ها» و «حساب‌های دو طرفه» قابل انتخابند.
+// برای وصل شدن به موجودی واقعی، نام حساب بانکی در درخت باید با نام آن در «حساب‌ها و کارت‌ها» یکسان باشد.
+function SourceAccountField({ accounts, categories, accountId, fromCategoryId, onChange, st, allowTwoWay = true, title = "انتخاب حساب" }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const byId = (id) => categories.find((c) => c.id === id);
+  const twoWayAnc = (c) => { let p = c, g = 0; while (p && g++ < 8) { if (p.twoWay) return true; p = byId(p.parentId); } return false; };
+  const selectable = (c) => c.kind === "bank" || (allowTwoWay && twoWayAnc(c));
+  const accSel = accounts.find((a) => a.id === accountId);
+  const catSel = fromCategoryId ? byId(fromCategoryId) : null;
+  const label = catSel ? accountPath(categories, catSel).join(" / ") : accSel ? accSel.name : "";
+  const treeValue = fromCategoryId || categories.find((c) => c.kind === "bank" && accSel && faKey(c.name) === faKey(accSel.name))?.id;
+  function resolve(c) {
+    if (c.kind === "bank") {
+      let p = c, g = 0;
+      while (p && g++ < 8) {
+        const acc = accounts.find((a) => faKey(a.name) === faKey(p.name));
+        if (acc) return { accountId: acc.id, fromCategoryId: "" };
+        p = byId(p.parentId);
+      }
+      return { error: `نام «${c.name}» با هیچ حسابی در «حساب‌ها و کارت‌ها» یکسان نیست؛ برای وصل شدن به موجودی بانک، نام‌ها را یکی کنید.` };
+    }
+    return { accountId: "", fromCategoryId: c.id };
+  }
+  function pick(id) {
+    const c = byId(id); if (!c) return;
+    const r = resolve(c);
+    if (r.error) { window.alert(r.error); return; }
+    onChange(r); setOpen(false);
+  }
+  return <>
+    <button type="button" onClick={() => setOpen(true)} style={{ width: "100%", minHeight: 46, marginBottom: 8, padding: "9px 12px", borderRadius: 10, border: `1.5px solid ${t.inputBorder}`, background: t.input, color: label ? t.text : t.sub, display: "flex", alignItems: "center", justifyContent: "space-between", fontFamily: "inherit", cursor: "pointer", textAlign: "right" }}>
+      <span style={{ fontSize: 13.5, fontWeight: label ? 700 : 500 }}>{label || title}</span><ChevronLeft size={17} style={{ transform: "rotate(90deg)", flexShrink: 0 }} />
+    </button>
+    {open && toBody(<div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 700, display: "flex", alignItems: "flex-end", justifyContent: "center", maxWidth: 480, margin: "0 auto", fontFamily: FONT, direction: "rtl" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: t.bg || t.card, width: "100%", maxHeight: "80vh", overflowY: "auto", borderRadius: "18px 18px 0 0", padding: "16px 14px calc(18px + env(safe-area-inset-bottom, 0px))" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+          <button type="button" onClick={() => setOpen(false)} style={{ border: 0, background: "transparent", color: t.sub, padding: 5 }}><X size={21} /></button>
+          <div style={{ fontWeight: 800, fontSize: 15 }}>{title}</div><span style={{ width: 31 }} />
+        </div>
+        <div style={{ fontSize: 11.5, color: t.sub, lineHeight: 1.9, marginBottom: 10 }}>{allowTwoWay ? "فقط حساب‌های بانکی و حساب‌های دو طرفه قابل انتخاب‌اند؛ بقیه کم‌رنگ هستند." : "فقط حساب‌های بانکی قابل انتخاب‌اند؛ بقیه کم‌رنگ هستند."}</div>
+        <AccountsTree mode="pick" categories={categories} value={treeValue} selectable={selectable} defaultExpanded={{ "g:bank": true }} onPick={pick} onBlocked={() => window.alert(allowTwoWay ? "این حساب قابل انتخاب نیست. فقط «بانک‌ها» و حساب‌های «دو طرفه» انتخاب می‌شوند." : "این حساب قابل انتخاب نیست. فقط «بانک‌ها» انتخاب می‌شوند.")} />
+      </div>
+    </div>)}
+  </>;
+}
+
 function AddTransactionSheet({ accounts, categories, favorites, members = [], events = [], projects = [], initial, onClose, onSubmit, onAddAccount, onAddCategory }) {
   const st = useStyles();
   const [type, setType] = useState(initial?.type || "expense");
@@ -5372,7 +5389,8 @@ function AddTransactionSheet({ accounts, categories, favorites, members = [], ev
     }
     return "";
   });
-  const [accountId, setAccountId] = useState(initial?.accountId || accounts[0]?.id || "");
+  const [accountId, setAccountId] = useState(initial?.fromCategoryId ? "" : (initial?.accountId || accounts[0]?.id || ""));
+  const [fromCategoryId, setFromCategoryId] = useState(initial?.fromCategoryId || "");
   const [toAccountId, setToAccountId] = useState(initial?.toAccountId || accounts[1]?.id || accounts[0]?.id || "");
   const [date, setDate] = useState(initial?.date || todayISO());
   const [time, setTime] = useState(initial?.time || new Date().toTimeString().slice(0, 5));
@@ -5391,7 +5409,7 @@ function AddTransactionSheet({ accounts, categories, favorites, members = [], ev
   const effectiveSide = side || (type === "income" ? "creditor" : "debtor");
   const filteredCats = categories.filter((c) => c.kind === type);
   const favCats = filteredCats.filter((c) => favorites.categories.includes(c.id));
-  const canSubmit = amount && Number(amount) > 0 && accountId && (type === "transfer" ? toAccountId && toAccountId !== accountId : categoryId);
+  const canSubmit = amount && Number(amount) > 0 && (accountId || (type !== "transfer" && fromCategoryId)) && (type === "transfer" ? toAccountId && toAccountId !== accountId : categoryId);
 
   async function handlePhoto(e) {
     const f = e.target.files[0];
@@ -5411,7 +5429,7 @@ function AddTransactionSheet({ accounts, categories, favorites, members = [], ev
 
         <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
           {[{ k: "expense", l: "پرداخت", c: BRAND.crimson }, { k: "income", l: "دریافت", c: BRAND.darkgreen }, { k: "transfer", l: "انتقال", c: BRAND.violet }].map((o) => (
-            <button key={o.k} onClick={() => { setType(o.k); setCategoryId(""); setSide(""); }} style={{ flex: 1, padding: "10px 4px", borderRadius: 9, border: `1.5px solid ${type === o.k ? o.c : "#e3e0ea"}`, background: type === o.k ? o.c : "#fff", color: type === o.k ? "#fff" : "#241a30", fontWeight: 700, cursor: "pointer", fontSize: 13.5 }}>{o.l}</button>
+            <button key={o.k} onClick={() => { setType(o.k); setCategoryId(""); setSide(""); if (o.k === "transfer" && !accountId) { setAccountId(accounts[0]?.id || ""); setFromCategoryId(""); } }} style={{ flex: 1, padding: "10px 4px", borderRadius: 9, border: `1.5px solid ${type === o.k ? o.c : "#e3e0ea"}`, background: type === o.k ? o.c : "#fff", color: type === o.k ? "#fff" : "#241a30", fontWeight: 700, cursor: "pointer", fontSize: 13.5 }}>{o.l}</button>
           ))}
         </div>
 
@@ -5448,7 +5466,7 @@ function AddTransactionSheet({ accounts, categories, favorites, members = [], ev
             )}
             <label style={st.label}>{type === "expense" ? "از حساب" : "به حساب"}</label>
             <div style={{ display: "flex", gap: 6 }}>
-              <div style={{ flex: 1, minWidth: 0 }}><BankAccountField accounts={accounts} value={accountId} onChange={setAccountId} st={st} /></div>
+              <div style={{ flex: 1, minWidth: 0 }}><SourceAccountField accounts={accounts} categories={categories} accountId={accountId} fromCategoryId={fromCategoryId} onChange={(v) => { setAccountId(v.accountId); setFromCategoryId(v.fromCategoryId); }} st={st} title={type === "expense" ? "از حساب" : "به حساب"} /></div>
               <button onClick={() => { setInlineAdd("account"); setInlineName(""); }} style={{ ...miniBtn, width: 44, height: 44, background: BRAND.violet, color: "#fff" }}><Plus size={18} /></button>
             </div>
             {inlineAdd && <div style={{ background: "#f7f4fa", borderRadius: 10, padding: 10, marginBottom: 10 }}>
@@ -5459,7 +5477,7 @@ function AddTransactionSheet({ accounts, categories, favorites, members = [], ev
                   if (!inlineName.trim()) return;
                   const id = uid();
                   if (inlineAdd === "category") { onAddCategory?.({ id, name: inlineName.trim(), kind: type }); setCategoryId(id); }
-                  else { onAddAccount?.({ id, name: inlineName.trim(), type: "bank", initial: 0 }); setAccountId(id); }
+                  else { onAddAccount?.({ id, name: inlineName.trim(), type: "bank", initial: 0 }); setAccountId(id); setFromCategoryId(""); }
                   setInlineAdd(null);
                 }} style={{ ...st.primaryBtn, width: "auto", padding: "0 14px" }}>افزودن</button>
               </div>
@@ -5528,7 +5546,7 @@ function AddTransactionSheet({ accounts, categories, favorites, members = [], ev
         <button disabled={!canSubmit}
           onClick={() => onSubmit({
             ...(initial?._editId ? { _editId: initial._editId } : {}),
-            type, amount: Number(amount), categoryId, accountId,
+            type, amount: Number(amount), categoryId, accountId, fromCategoryId: type !== "transfer" && fromCategoryId ? fromCategoryId : undefined,
             toAccountId: type === "transfer" ? toAccountId : undefined,
             side: twoWayPicked ? effectiveSide : undefined,
             date, time, note, photo: photo || undefined,
